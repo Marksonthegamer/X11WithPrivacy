@@ -23,7 +23,6 @@
 #include <dixstruct.h>
 
 #include <systemd/sd-journal.h>
-#include <json-c/json.h>
 #include <pthread.h>
 #include <sys/inotify.h>
 #include <unistd.h>
@@ -52,14 +51,14 @@
 #define LOG_XRECORD		3
 #define LOG_CLIPBOARD	4
 
-#define LOG_SCREENSHOT_BODY	"Screenshot restricted.\n"
-#define LOG_SCREENCAST_BODY	"Screencast restricted.\n"
-#define LOG_XRECORD_BODY	"Xsession record or replay restricted.\n"
-#define LOG_CLIPBOARD_BODY	"Clipboard restricted.\n"
-#define LOG_UNKNOWN_BODY	"Unknown action restricted.\n"
+#define LOG_SCREENSHOT_BODY	"Screenshot restricted for process "
+#define LOG_SCREENCAST_BODY	"Screencast restricted for process "
+#define LOG_XRECORD_BODY	"Xsession record or replay restricted for process "
+#define LOG_CLIPBOARD_BODY	"Clipboard restricted. for process "
+#define LOG_UNKNOWN_BODY	"Unknown action restricted for process "
 
-#define NOTIFY_MSG_SCR	"screenshot and screencast detected"
-#define NOTIFY_MSG_CLP	"clipboard detected"
+#define NOTIFY_MSG_SCR	" attempts to capture your screen."
+#define NOTIFY_MSG_CLP	" attempts to capture your clipboard."
 
 #define INOTIFY_MAX_EVENTS	1024 /* Max. number of events to process at one go */
 #define INOTIFY_LEN_NAME 	16 /* Assuming that the length of the filename won't exceed 16 bytes */
@@ -76,6 +75,13 @@
 #define POLICY_DISALLOW_STR	"disallow"
 
 #define PID_SAVE_TIMEOUT	5
+
+#define WHITELIST_PATH      "/etc/xsm/whitelist"
+#define MAX_WHITELIST_ENTRIES   64
+#define MAX_CMDNAME_LEN         256
+
+void write_journal_log(int priority, const char *logmsg, const char *custom_fields);
+int parse_policy_value(const char *buf, long size, const char *key);
 
 
 static MODULESETUPPROTO(XsmSetup);
@@ -165,34 +171,39 @@ XsmAudit(const char *format, ...)
 }
 
 
-void dbus_notify_signal(const char *noti_msg)
+void dbus_notify_signal(const char *process_name, const char *noti_msg)
 {
+    DBusError err;
+    dbus_error_init(&err);
 
-	DBusError err;
-	dbus_error_init(&err);
+    // Connect to SYSTEM bus (accessible by X Server)
+    DBusConnection* conn = dbus_bus_get(DBUS_BUS_SYSTEM, &err);
+    if (conn == NULL || dbus_error_is_set(&err)) {
+        write_journal_log(LOG_WARNING, "D-Bus System Bus connection failed", err.message);
+        dbus_error_free(&err);
+        return; // Don't exit! Just skip the signal.
+    }
 
-	DBusConnection* conn = dbus_bus_get(DBUS_BUS_SYSTEM, &err);
-	if (conn == NULL || dbus_error_is_set(&err)) { 
-		dbus_error_free(&err); 
-		exit(1); 
-	}
+    // Define unique identifiers for your signal
+    DBusMessage* dbus_msg = dbus_message_new_signal(
+                            "/org/xsm/SecurityAlert",  // Path
+                            "org.xsm.SecurityInterface", // Interface
+                            "ViolationDetected");       // Signal Name
+    if (NULL == dbus_msg) {
+		dbus_connection_unref(conn);
+        return;
+    }
 
-	DBusMessage* dbus_msg = dbus_message_new_signal(
-                            "dbus path",
-                            "dbus interface", 
-                            "signal name"); 
-	if (NULL == dbus_msg) { 
-		exit(1); 
-	}
+    dbus_message_append_args(dbus_msg, DBUS_TYPE_STRING, &process_name, DBUS_TYPE_STRING, &noti_msg, DBUS_TYPE_INVALID);
 
-    dbus_message_append_args(dbus_msg, DBUS_TYPE_STRING, &noti_msg, DBUS_TYPE_INVALID);
+    dbus_uint32_t serial = 0;
+    if (!dbus_connection_send(conn, dbus_msg, &serial)) {
+        write_journal_log(LOG_WARNING, "Failed to send D-Bus signal", "");
+    }
 
-	dbus_uint32_t serial = 0;
-	if (!dbus_connection_send(conn, dbus_msg, &serial)) {
-		exit(1);
-	}
-	printf("sent (serial=%d)\n", serial);
-	dbus_message_unref(dbus_msg);
+    dbus_connection_flush(conn);
+    dbus_message_unref(dbus_msg);
+	dbus_connection_unref(conn);
 }
 
 
@@ -206,7 +217,7 @@ void dbus_notify_signal(const char *noti_msg)
 /* LOG_INFO		6	informational */
 /* LOG_DEBUG	7	debug-level messages */
 
-static void write_journal_log(int priority, const char *logmsg, const char *custom_fields)
+void write_journal_log(int priority, const char *logmsg, const char *custom_fields)
 {
 	/*
 	openlog(LOG_ID, LOG_NDELAY, LOG_DAEMON);
@@ -227,6 +238,80 @@ static int screencast_allow = XSM_ALLOW;
 static int xrecord_allow = XSM_ALLOW;
 static int clipboard_allow = XSM_ALLOW;
 
+static char *whitelist[MAX_WHITELIST_ENTRIES];
+static int   whitelist_count = 0;
+
+
+/*
+ * Check whitelist of application
+ *
+ */
+static void free_whitelist(void)
+{
+    for (int i = 0; i < whitelist_count; i++) {
+        if (whitelist[i]) {
+            free(whitelist[i]);
+            whitelist[i] = NULL;
+        }
+    }
+    whitelist_count = 0;
+}
+
+void read_whitelist(void)
+{
+    FILE *fp;
+    char line[MAX_CMDNAME_LEN];
+    int count = 0;
+
+    free_whitelist();   /* clear previous list */
+
+    fp = fopen(WHITELIST_PATH, "r");
+    if (fp == NULL) {
+        write_journal_log(LOG_WARNING, "Whitelist file not found. Using empty whitelist.", "");
+        return;
+    }
+
+    while (fgets(line, sizeof(line), fp) && count < MAX_WHITELIST_ENTRIES) {
+        /* Remove trailing newline and whitespace */
+        char *p = line;
+        while (*p && (*p == ' ' || *p == '\t')) p++;   /* skip leading whitespace */
+
+        char *end = p + strlen(p) - 1;
+        while (end > p && (*end == '\n' || *end == '\r' || *end == ' ' || *end == '\t')) {
+            *end = '\0';
+            end--;
+        }
+
+        if (*p == '\0' || *p == '#') continue;   /* skip empty lines and comments */
+
+        whitelist[count] = strdup(p);
+        if (whitelist[count]) {
+            count++;
+        }
+    }
+
+    fclose(fp);
+    whitelist_count = count;
+
+    char msg[128];
+    snprintf(msg, sizeof(msg), "Whitelist loaded: %d entries", count);
+    write_journal_log(LOG_NOTICE, msg, "");
+    LogMessage(X_INFO, "Whitelist loaded from %s (%d entries)\n", WHITELIST_PATH, count);
+}
+
+/* Check if cmdname is in the whitelist */
+static int is_whitelist(const char *cmdname)
+{
+    if (!cmdname || whitelist_count == 0)
+        return 0;
+
+    for (int i = 0; i < whitelist_count; i++) {
+        if (whitelist[i] && strcmp(whitelist[i], cmdname) == 0)
+            return 1;
+    }
+    return 0;
+}
+
 static int policy_check(int idx)
 {
 	if(idx == XSM_SCREENSHOT)
@@ -246,133 +331,121 @@ static int policy_check(int idx)
  */
 static void read_policy(void)
 {
-	FILE *fp;
-	char policy_buf[POLICY_BUF_SIZE];
-	struct json_object *parsed_json;
-	struct json_object *clipboard;
-	struct json_object *screenshot;
-	struct json_object *screencast;
-	struct json_object *xrecord;
-	const char *screencapt_policy, *clipboard_policy;
-	const char *screenshot_policy, *screencast_policy, *xrecord_policy;
+    FILE *fp;
+    char *policy_buf = NULL;
+    long file_size;
+    int val;
 
-	fp = fopen(DEFAULT_POLICY_PATH, "r");
-	if(fp == NULL)
-	{
-		write_journal_log(LOG_WARNING, "Default-policy file: Not exist!!", "");
-		write_journal_log(LOG_WARNING, "Screen-capture & clipboard: No restrict.", "");
-		screenshot_allow = XSM_ALLOW;
-		screencast_allow = XSM_ALLOW;
-		xrecord_allow = XSM_ALLOW;
-		clipboard_allow = XSM_ALLOW;
-		return;
-	}
-	else
-		write_journal_log(LOG_NOTICE, "Default-policy file: Loaded", "");
-	
-	fread(policy_buf, POLICY_BUF_SIZE, 1, fp);
-	fclose(fp);
+    fp = fopen(DEFAULT_POLICY_PATH, "r");
+    if (fp == NULL) {
+        write_journal_log(LOG_WARNING, "Default-policy file: Not exist!!", "");
+        write_journal_log(LOG_WARNING, "Screen-capture & clipboard: No restrict.", "");
+        screenshot_allow = screencast_allow = xrecord_allow = clipboard_allow = XSM_ALLOW;
+        return;
+    }
 
-	/* Parse json policy */
-	parsed_json = json_tokener_parse(policy_buf);
-	if(parsed_json == NULL)
-	{
-		write_journal_log(LOG_WARNING, "Policy-file: Json parsing error!", "");
-		return;	
-	}
+    write_journal_log(LOG_NOTICE, "Default-policy file: Loaded", "");
 
-	/* Get object in json policy */
-	json_object_object_get_ex(parsed_json, POLICY_SCRS_ATTR, &screenshot);
-	json_object_object_get_ex(parsed_json, POLICY_SCRT_ATTR, &screencast);
-	json_object_object_get_ex(parsed_json, POLICY_XRER_ATTR, &xrecord);
-	json_object_object_get_ex(parsed_json, POLICY_CLIP_ATTR, &clipboard);
+    /* Get file size */
+    fseek(fp, 0, SEEK_END);
+    file_size = ftell(fp);
+    rewind(fp);
 
-	/* Json object to string */
-	screenshot_policy = json_object_get_string(screenshot);
-	screencast_policy = json_object_get_string(screencast);
-	xrecord_policy = json_object_get_string(xrecord);
-	clipboard_policy = json_object_get_string(clipboard);
+    if (file_size <= 0) {
+        fclose(fp);
+        write_journal_log(LOG_WARNING, "Policy file is empty!", "");
+        screenshot_allow = screencast_allow = xrecord_allow = clipboard_allow = XSM_ALLOW;
+        return;
+    }
 
-	/* Set screen capture policy e.g. screenshot,screencast, xrecord&replay */
-	if(screenshot_policy) 
-	{
-		if(!strcmp(screenshot_policy, POLICY_ALLOW_STR))
-		{
-			screenshot_allow = XSM_ALLOW;
-			write_journal_log(LOG_NOTICE, "Screenshot: Allow", "");
-		}
-		else if(!strcmp(screenshot_policy, POLICY_DISALLOW_STR))
-		{
-			screenshot_allow = XSM_DISALLOW;
-			write_journal_log(LOG_NOTICE, "Screen-capture: Disallow", "");
-		}
-	}
-	else
-	{
-		screenshot_allow = XSM_ALLOW;
-		write_journal_log(LOG_WARNING, "Policy-file: Screenshot rule not exist!", "");
-		write_journal_log(LOG_WARNING, "Screenshot: No restrict", "");
-	}
+    /* Allocate buffer */
+    policy_buf = calloc(1, file_size + 1);
+    if (!policy_buf) {
+        fclose(fp);
+        write_journal_log(LOG_ERR, "Memory allocation failed for policy", "");
+        return;
+    }
 
-	if(screencast_policy)
-	{
-		if(!strcmp(screencast_policy, POLICY_ALLOW_STR))
-		{
-			screencast_allow = XSM_ALLOW;
-			write_journal_log(LOG_NOTICE, "Screencast: Allow", "");
-		}
-		else if(!strcmp(screencast_policy, POLICY_DISALLOW_STR))
-		{
-			screencast_allow = XSM_DISALLOW;
-			write_journal_log(LOG_NOTICE, "Screencast: Disallow", "");
-		}
-	}
-	else
-	{
-		screencast_allow = XSM_ALLOW;
-		write_journal_log(LOG_WARNING, "Policy-file: Screencast rule not exist!", "");
-		write_journal_log(LOG_WARNING, "Screencast: No restrict", "");
-	}
+    /* Read file */
+    if (fread(policy_buf, 1, file_size, fp) != (size_t)file_size) {
+        free(policy_buf);
+        fclose(fp);
+        write_journal_log(LOG_WARNING, "Failed to read policy file", "");
+        return;
+    }
+    fclose(fp);
 
-	if(xrecord_policy != NULL)
-	{
-		if(!strcmp(xrecord_policy, POLICY_ALLOW_STR))
-		{
-			xrecord_allow = XSM_ALLOW;
-			write_journal_log(LOG_NOTICE, "Xrecord: Allow", "");
-		}
-		else if(!strcmp(xrecord_policy, POLICY_DISALLOW_STR))
-		{
-			xrecord_allow = XSM_DISALLOW;
-			write_journal_log(LOG_NOTICE, "Xrecord: Disallow", "");
-		}
-	}
-	else
-	{
-		xrecord_allow = XSM_ALLOW;
-		write_journal_log(LOG_WARNING, "Policy-file: Xrecord rule not exist!", "");
-		write_journal_log(LOG_WARNING, "Xrecord: No restrict", "");
-	}
-	
-	if(clipboard_policy != NULL) /* Set clipboard policy */
-	{
-		if(!strcmp(clipboard_policy, POLICY_ALLOW_STR))
-		{
-			clipboard_allow = XSM_ALLOW;
-			write_journal_log(LOG_NOTICE, "Clipboard: Allow", "");
-		}
-		else if(!strcmp(clipboard_policy, POLICY_DISALLOW_STR))
-		{
-			clipboard_allow = XSM_DISALLOW;
-			write_journal_log(LOG_NOTICE, "Clipboard: Disallow", "");
-		}
-	}
-	else
-	{
-		clipboard_allow = XSM_ALLOW;
-		write_journal_log(LOG_WARNING, "Policy-file: Clibboard value not exist!", "");
-		write_journal_log(LOG_WARNING, "Clipboard: No restrict", "");
-	}
+    LogMessage(X_INFO, "Policy buffer loaded (size=%ld)\n", file_size);
+
+    /* Parse Screenshot */
+    val = parse_policy_value(policy_buf, file_size, POLICY_SCRS_ATTR);
+    if (val != -1) screenshot_allow = val;
+    else screenshot_allow = XSM_ALLOW; // Default
+    
+    /* Parse Screencast */
+    val = parse_policy_value(policy_buf, file_size, POLICY_SCRT_ATTR);
+    if (val != -1) screencast_allow = val;
+    else screencast_allow = XSM_ALLOW;
+
+    /* Parse Xrecord */
+    val = parse_policy_value(policy_buf, file_size, POLICY_XRER_ATTR);
+    if (val != -1) xrecord_allow = val;
+    else xrecord_allow = XSM_ALLOW;
+
+    /* Parse Clipboard */
+    val = parse_policy_value(policy_buf, file_size, POLICY_CLIP_ATTR);
+    if (val != -1) clipboard_allow = val;
+    else clipboard_allow = XSM_ALLOW;
+
+    free(policy_buf);
+    
+    LogMessage(X_INFO, "Policy applied successfully.\n");
+}
+
+int parse_policy_value(const char *buf, long size, const char *key) {
+    const char *ptr = buf;
+    long key_len = strlen(key);
+    const char *end = buf + size;
+
+    // Simple search for "key"
+    while (ptr + key_len < end) {
+        if (strncmp(ptr, key, key_len) == 0) {
+            // Key found, look for colon and value
+            const char *val_ptr = ptr + key_len;
+            while (val_ptr < end && (*val_ptr == ' ' || *val_ptr == ':' || *val_ptr == '"' || *val_ptr == '\t')) {
+                val_ptr++;
+            }
+
+            if (strncmp(val_ptr, "allow", 5) == 0) {
+                return XSM_ALLOW;
+            } else if (strncmp(val_ptr, "disallow", 8) == 0) {
+                return XSM_DISALLOW;
+            }
+            return -1; // Key found but value invalid
+        }
+        ptr++;
+    }
+    return -1; // Key not found
+}
+
+int apply_policy(const char *pol_str, int idx, const char *name)
+{
+    if (!pol_str) {
+        write_journal_log(LOG_WARNING, "Policy-file: %s rule not exist!", name);
+        write_journal_log(LOG_WARNING, "%s: No restrict", name);
+        return XSM_ALLOW;
+    }
+
+    if (!strcmp(pol_str, POLICY_ALLOW_STR)) {
+        write_journal_log(LOG_NOTICE, "%s: Allow", name);
+        return XSM_ALLOW;
+    } else if (!strcmp(pol_str, POLICY_DISALLOW_STR)) {
+        write_journal_log(LOG_NOTICE, "%s: Disallow", name);
+        return XSM_DISALLOW;
+    }
+
+    write_journal_log(LOG_WARNING, "Policy-file: Invalid %s value!", name);
+    return XSM_ALLOW;
 }
 
 
@@ -413,8 +486,10 @@ static void *inotify_policy_thread(void *param)
 					*/
 
 					/* "event->name" monitored file name via inotify */
-					if(!strcmp(event->name, "user.rules") || !strcmp(event->name, "default.rules"))
+					if(!strcmp(event->name, "user.rules") || !strcmp(event->name, "default.rules")||
+					!strcmp(event->name, "whitelist"))
 						read_policy();
+						read_whitelist();
 						//printf( "The file %s was Created with WD %d\n", event->name, event->wd );
 				}
 				 
@@ -475,7 +550,7 @@ static void renew_pid()
 	clipboard_pid = 0;
 }
 
-static void make_log(int idx, pid_t cmdpid)
+static void make_log(int idx, pid_t cmdpid, const char *cmdname)
 {
 	if(timer == 0)
 	{
@@ -486,30 +561,54 @@ static void make_log(int idx, pid_t cmdpid)
 	if(idx == LOG_SCREENSHOT && cmdpid != screenshot_pid)
 	{
 		screenshot_pid = cmdpid;
-		//dbus_notify_signal(NOTIFY_MSG_SCR);
-		write_journal_log(LOG_CRIT, LOG_SCREENSHOT_BODY, "");
-		LogMessage(X_INFO, LOG_SCREENSHOT_BODY);
+		char message[256];
+		strcpy(message, cmdname);
+		strcat(message, NOTIFY_MSG_SCR);
+		dbus_notify_signal(cmdname, message);
+		strcpy(message, LOG_SCREENSHOT_BODY);
+		strcat(message, cmdname);
+		strcat(message, "\n");
+		write_journal_log(LOG_CRIT, message, "");
+		LogMessage(X_INFO, "%s", message);
 	}
 	else if(idx == LOG_SCREENCAST && cmdpid != screencast_pid)
 	{
 		screencast_pid = cmdpid;
-		//dbus_notify_signal(NOTIFY_MSG_SCR);
-		write_journal_log(LOG_CRIT, LOG_SCREENCAST_BODY, "");
-		LogMessage(X_INFO, LOG_SCREENCAST_BODY);
+		char message[256];
+		strcpy(message, cmdname);
+		strcat(message, NOTIFY_MSG_SCR);
+		dbus_notify_signal(cmdname, message);
+		strcpy(message, LOG_SCREENCAST_BODY);
+		strcat(message, cmdname);
+		strcat(message, "\n");
+		write_journal_log(LOG_CRIT, message, "");
+		LogMessage(X_INFO, "%s", message);
 	}
 	else if(idx == LOG_XRECORD && cmdpid != xrecord_pid)
 	{
 		xrecord_pid = cmdpid;
-		//dbus_notify_signal(NOTIFY_MSG_SCR);
-		write_journal_log(LOG_CRIT, LOG_XRECORD_BODY, "");
-		LogMessage(X_INFO, LOG_XRECORD_BODY);
+		char message[256];
+		strcpy(message, cmdname);
+		strcat(message, NOTIFY_MSG_SCR);
+		dbus_notify_signal(cmdname, message);
+		strcpy(message, LOG_XRECORD_BODY);
+		strcat(message, cmdname);
+		strcat(message, "\n");
+		write_journal_log(LOG_CRIT, message, "");
+		LogMessage(X_INFO, "%s", message);
 	}
 	else if(idx == LOG_CLIPBOARD && cmdpid != clipboard_pid)
 	{
 		clipboard_pid = cmdpid;
-		//dbus_notify_signal(NOTIFY_MSG_CLP);
-		write_journal_log(LOG_CRIT, LOG_CLIPBOARD_BODY, "");
-		LogMessage(X_INFO, LOG_CLIPBOARD_BODY);
+		char message[256];
+		strcpy(message, cmdname);
+		strcat(message, NOTIFY_MSG_CLP);
+		dbus_notify_signal(cmdname, message);;
+		strcpy(message, LOG_CLIPBOARD_BODY);
+		strcat(message, cmdname);
+		strcat(message, "\n");
+		write_journal_log(LOG_CRIT, message, "");
+		LogMessage(X_INFO, "%s", message);
 	}
 	
 	clock_gettime(CLOCK_REALTIME, &after);
@@ -520,28 +619,6 @@ static void make_log(int idx, pid_t cmdpid)
 		timer = 0;
 	}
 }
-
-
-/*
- * Check whitelist of application
- *
- */
-static int is_whitelist(const char *cmdname)
-{
-	if(!strcmp(cmdname, "/usr/bin/gnome-shell"))
-		return 1;
-	else if(!strcmp(cmdname, "xfce4-session"))
-		return 1;
-	else if(!strcmp(cmdname, "cinnamon"))
-		return 1;
-	else if(!strcmp(cmdname, "/usr/lib/at-spi2-core/at-spi2-registryd"))
-		return 1;
-	else if(!strcmp(cmdname, "/usr/lib/vmware-tools/sbin64/vmtoolsd"))
-		return 1;
-
-	return 0;
-}
-
 
 static void *
 XsmSetup(void *module, void *opts, int *errmaj, int *errmin)
@@ -570,6 +647,9 @@ XsmResource(CallbackListPtr *pcbl, void *unused, void *calldata){
 	cmdargs = GetClientCmdArgs(rec->client);
 	cmdpid = GetClientPid(rec->client);
 
+	int request_client = rec->client->index;
+    Bool is_foreign_window = (rec->rtype == RT_WINDOW) && (cid != request_client);
+
 	if(requestName == NULL || cmdname == NULL)
 		return;
 
@@ -577,8 +657,7 @@ XsmResource(CallbackListPtr *pcbl, void *unused, void *calldata){
 	if(requested & DixReadAccess)
 	{
 		/* Restrict Screencast e.g. recordmydesktop, kazam, scrot? */
-		if(!strcmp(requestName, "MIT-SHM:GetImage") && rec->rtype == RT_WINDOW){
-
+		if(rec->rtype == RT_WINDOW && !strcmp(requestName, "MIT-SHM:GetImage")){
 			XsmAudit("XsmResource: client(%d) access(%lx) to resource(0x%lx) "
 				"of client(%d) on request(%s) resource(%s) "
 				"cmdname: %s(%d) args: %s\n", 
@@ -586,10 +665,10 @@ XsmResource(CallbackListPtr *pcbl, void *unused, void *calldata){
 				(unsigned long)rec->id, cid, requestName, resourceName,
 				cmdname, cmdpid, cmdargs);
 			
-			//if(!policy_check(XSM_SCREENSHOT) && !is_whitelist(cmdname))
-			if(!policy_check(XSM_SCREENCAST) && !is_whitelist(cmdname))
+			if((!policy_check(XSM_SCREENSHOT) || !policy_check(XSM_SCREENCAST)) && !is_whitelist(cmdname) && is_foreign_window)
 			{
-				make_log(LOG_SCREENCAST, cmdpid);
+				if(!policy_check(XSM_SCREENSHOT)) make_log(LOG_SCREENSHOT, cmdpid, cmdname);
+				if(!policy_check(XSM_SCREENCAST)) make_log(LOG_SCREENCAST, cmdpid, cmdname);
 				rec->status = BadAccess;
 			}
 			return;
@@ -605,9 +684,9 @@ XsmResource(CallbackListPtr *pcbl, void *unused, void *calldata){
 				(unsigned long)rec->id, cid, requestName, resourceName,
 				cmdname, cmdpid, cmdargs);
 			
-			if(!policy_check(XSM_SCREENSHOT))
+			if(!policy_check(XSM_SCREENSHOT) && !is_whitelist(cmdname) && is_foreign_window)
 			{
-				make_log(LOG_SCREENSHOT, cmdpid);
+				make_log(LOG_SCREENSHOT, cmdpid, cmdname);
 				rec->status = BadAccess;
 			}
 			return;
@@ -617,12 +696,17 @@ XsmResource(CallbackListPtr *pcbl, void *unused, void *calldata){
 		if(rec->rtype == RT_PIXMAP && !strcmp(requestName, "X11:GetImage"))
 		{
 			XsmAudit("XsmResource: client(%d) access(%lx) to resource(0x%lx) "
-				"of client(%d) on request(%s) resource(%s,%p) "
+				"of client(%d) on request(%s) resource(%s,%u) "
 				"cmdname: %s(%d) args: %s\n", 
 				rec->client->index,	(unsigned long)requested, 
 				(unsigned long)rec->id, cid, requestName, resourceName, rec->rtype,
 				cmdname, cmdpid, cmdargs);
 
+			if(!policy_check(XSM_SCREENSHOT) && !is_whitelist(cmdname) && is_foreign_window)
+			{
+				make_log(LOG_SCREENSHOT, cmdpid, cmdname);
+				rec->status = BadAccess;
+			}
 			return;
 		}
 
@@ -631,15 +715,15 @@ XsmResource(CallbackListPtr *pcbl, void *unused, void *calldata){
 		if((rec->rtype == RT_WINDOW) && !strcmp(requestName, "X11:CopyArea"))
 		{
 			XsmAudit("XsmResource: client(%d) access(%lx) to resource(0x%lx) "
-				"of client(%d) on request(%s) resource(%s,%p) "
+				"of client(%d) on request(%s) resource(%s,%u) "
 				"cmdname: %s(%d) args: %s\n", 
 				rec->client->index,	(unsigned long)requested, 
 				(unsigned long)rec->id, cid, requestName, resourceName, rec->rtype,
 				cmdname, cmdpid, cmdargs);
 			
-			if(!policy_check(XSM_SCREENSHOT) && !is_whitelist(cmdname))
+			if(!policy_check(XSM_SCREENSHOT) && !is_whitelist(cmdname) && is_foreign_window)
 			{
-				make_log(LOG_SCREENSHOT, cmdpid);
+				make_log(LOG_SCREENSHOT, cmdpid, cmdname);
 				rec->status = BadAccess;
 			}
 			return;
@@ -691,7 +775,7 @@ XsmExtension(CallbackListPtr *pcbl, void *unused, void *calldata)
 		
 		if(!policy_check(XSM_XRECORD) && !is_whitelist(cmdname))
 		{
-			make_log(LOG_XRECORD, cmdpid);
+			make_log(LOG_XRECORD, cmdpid, cmdname);
 			rec->status = BadAccess;
 		}
 		return;
@@ -707,7 +791,7 @@ XsmExtension(CallbackListPtr *pcbl, void *unused, void *calldata)
 		
 		if(!policy_check(XSM_SCREENCAST) && !is_whitelist(cmdname))
 		{
-			make_log(LOG_SCREENCAST, cmdpid);
+			make_log(LOG_SCREENCAST, cmdpid, cmdname);
 			rec->status = BadAccess;
 		}
 		return;
@@ -784,7 +868,7 @@ XsmSelection(CallbackListPtr *pcbl, void *unused, void *calldata)
 		(pSel->window != 0x0)){
 
 		XsmAudit("XsmSelection: client %d access to server configuration request %s "
-				"atom %s(%p) window(%p) "
+				"atom %s(%u) window(%d) "
 				"cmdname %s(%d) args %s\n", 
 				rec->client->index, requestName,
 				NameForAtom(name), name, pSel->window,
@@ -792,7 +876,7 @@ XsmSelection(CallbackListPtr *pcbl, void *unused, void *calldata)
 
 		if(!policy_check(XSM_CLIPBOARD))
 		{
-			make_log(LOG_CLIPBOARD, cmdpid);
+			make_log(LOG_CLIPBOARD, cmdpid, cmdname);
 		
 			/* Delete Any Selections */
 			DeleteWindowFromAnySelections(pSel->pWin);
@@ -852,9 +936,10 @@ XsmExtensionInit(void)
 	/* Read Xsm policy file */
 	read_policy();
 
+	read_whitelist();
+
 	/* Run inotify policy loader */
 	inotify_policy();
-
 	/* 
 		X Access Control Extension Security hooks
 		Constants used to identify the available security hooks
