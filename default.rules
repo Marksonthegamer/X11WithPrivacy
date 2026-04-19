@@ -1,6 +1,6 @@
 {
-  "screenshot" : "allow",
-  "screencast" : "allow",
+  "screenshot" : "disallow",
+  "screencast" : "disallow",
   "xrecord" : "allow",
   "clipboard" : "allow",
 }

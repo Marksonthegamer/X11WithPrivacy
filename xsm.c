@@ -76,8 +76,20 @@
 
 #define PID_SAVE_TIMEOUT	5
 
-#define WHITELIST_PATH      "/etc/xsm/whitelist"
+#define WHITELIST_SCREENSHOT   "/etc/xsm/whitelist_screenshot"
+#define WHITELIST_SCREENCAST   "/etc/xsm/whitelist_screencast"
+#define WHITELIST_XRECORD      "/etc/xsm/whitelist_xrecord"
+#define WHITELIST_CLIPBOARD    "/etc/xsm/whitelist_clipboard"
+
+#define BLACKLIST_SCREENSHOT   "/etc/xsm/blacklist_screenshot"
+#define BLACKLIST_SCREENCAST   "/etc/xsm/blacklist_screencast"
+#define BLACKLIST_XRECORD      "/etc/xsm/blacklist_xrecord"
+#define BLACKLIST_CLIPBOARD    "/etc/xsm/blacklist_clipboard"
+
 #define MAX_WHITELIST_ENTRIES   64
+
+#define MAX_BLACKLIST_ENTRIES   64
+
 #define MAX_CMDNAME_LEN         256
 
 void write_journal_log(int priority, const char *logmsg, const char *custom_fields);
@@ -171,7 +183,7 @@ XsmAudit(const char *format, ...)
 }
 
 
-void dbus_notify_signal(const char *process_name, const char *noti_msg)
+void dbus_notify_signal(int idx, const char *process_name, const char *noti_msg)
 {
     DBusError err;
     dbus_error_init(&err);
@@ -194,7 +206,7 @@ void dbus_notify_signal(const char *process_name, const char *noti_msg)
         return;
     }
 
-    dbus_message_append_args(dbus_msg, DBUS_TYPE_STRING, &process_name, DBUS_TYPE_STRING, &noti_msg, DBUS_TYPE_INVALID);
+    dbus_message_append_args(dbus_msg, DBUS_TYPE_INT16, &idx, DBUS_TYPE_STRING, &process_name, DBUS_TYPE_STRING, &noti_msg, DBUS_TYPE_INVALID);
 
     dbus_uint32_t serial = 0;
     if (!dbus_connection_send(conn, dbus_msg, &serial)) {
@@ -238,79 +250,127 @@ static int screencast_allow = XSM_ALLOW;
 static int xrecord_allow = XSM_ALLOW;
 static int clipboard_allow = XSM_ALLOW;
 
-static char *whitelist[MAX_WHITELIST_ENTRIES];
-static int   whitelist_count = 0;
+static char *whitelist_screenshot[MAX_WHITELIST_ENTRIES];
+static char *whitelist_screencast[MAX_WHITELIST_ENTRIES];
+static char *whitelist_xrecord[MAX_WHITELIST_ENTRIES];
+static char *whitelist_clipboard[MAX_WHITELIST_ENTRIES];
+static int   whitelist_screenshot_count = 0;
+static int   whitelist_screencast_count = 0;
+static int   whitelist_xrecord_count = 0;
+static int   whitelist_clipboard_count = 0;
 
+static char *blacklist_screenshot[MAX_BLACKLIST_ENTRIES];
+static char *blacklist_screencast[MAX_BLACKLIST_ENTRIES];
+static char *blacklist_xrecord[MAX_BLACKLIST_ENTRIES];
+static char *blacklist_clipboard[MAX_BLACKLIST_ENTRIES];
+static int   blacklist_screenshot_count = 0;
+static int   blacklist_screencast_count = 0;
+static int   blacklist_xrecord_count = 0;
+static int   blacklist_clipboard_count = 0;
 
-/*
- * Check whitelist of application
- *
- */
-static void free_whitelist(void)
+/* Generic free for any list */
+static void free_list(char **list, int *count)
 {
-    for (int i = 0; i < whitelist_count; i++) {
-        if (whitelist[i]) {
-            free(whitelist[i]);
-            whitelist[i] = NULL;
-        }
+    for (int i = 0; i < *count; i++) {
+        if (list[i]) free(list[i]);
+        list[i] = NULL;
     }
-    whitelist_count = 0;
+    *count = 0;
 }
 
-void read_whitelist(void)
+/* Generic read function */
+static void read_list(const char *filepath, char **list, int *count)
 {
     FILE *fp;
     char line[MAX_CMDNAME_LEN];
-    int count = 0;
+    int c = 0;
 
-    free_whitelist();   /* clear previous list */
+    free_list(list, count);
 
-    fp = fopen(WHITELIST_PATH, "r");
+    fp = fopen(filepath, "r");
     if (fp == NULL) {
-        write_journal_log(LOG_WARNING, "Whitelist file not found. Using empty whitelist.", "");
+        // Log only for default files if needed, but keep quiet for optional ones
         return;
     }
 
-    while (fgets(line, sizeof(line), fp) && count < MAX_WHITELIST_ENTRIES) {
-        /* Remove trailing newline and whitespace */
+    while (fgets(line, sizeof(line), fp) && c < MAX_WHITELIST_ENTRIES) {
         char *p = line;
-        while (*p && (*p == ' ' || *p == '\t')) p++;   /* skip leading whitespace */
-
+        while (*p && (*p == ' ' || *p == '\t')) p++;
         char *end = p + strlen(p) - 1;
         while (end > p && (*end == '\n' || *end == '\r' || *end == ' ' || *end == '\t')) {
-            *end = '\0';
-            end--;
+            *end-- = '\0';
         }
+        if (*p == '\0' || *p == '#') continue;
 
-        if (*p == '\0' || *p == '#') continue;   /* skip empty lines and comments */
-
-        whitelist[count] = strdup(p);
-        if (whitelist[count]) {
-            count++;
-        }
+        list[c] = strdup(p);
+        if (list[c]) c++;
     }
-
     fclose(fp);
-    whitelist_count = count;
+    *count = c;
 
     char msg[128];
-    snprintf(msg, sizeof(msg), "Whitelist loaded: %d entries", count);
-    write_journal_log(LOG_NOTICE, msg, "");
-    LogMessage(X_INFO, "Whitelist loaded from %s (%d entries)\n", WHITELIST_PATH, count);
+    snprintf(msg, sizeof(msg), "Loaded %d entries from %s", c, filepath);
+    LogMessage(X_INFO, "%s\n", msg);
 }
 
-/* Check if cmdname is in the whitelist */
-static int is_whitelist(const char *cmdname)
-{
-    if (!cmdname || whitelist_count == 0)
-        return 0;
-
-    for (int i = 0; i < whitelist_count; i++) {
-        if (whitelist[i] && strcmp(whitelist[i], cmdname) == 0)
-            return 1;
-    }
+/* Per-action is_whitelisted */
+static int is_whitelisted_screenshot(const char *cmd) {
+    if (!cmd) return 0;
+    for (int i = 0; i < whitelist_screenshot_count; i++)
+        if (whitelist_screenshot[i] && strcmp(whitelist_screenshot[i], cmd) == 0) return 1;
     return 0;
 }
+
+static int is_whitelisted_screencast(const char *cmd) {
+    if (!cmd) return 0;
+    for (int i = 0; i < whitelist_screencast_count; i++)
+        if (whitelist_screencast[i] && strcmp(whitelist_screencast[i], cmd) == 0) return 1;
+    return 0;
+}
+
+static int is_whitelisted_xrecord(const char *cmd) {
+    if (!cmd) return 0;
+    for (int i = 0; i < whitelist_xrecord_count; i++)
+        if (whitelist_xrecord[i] && strcmp(whitelist_xrecord[i], cmd) == 0) return 1;
+    return 0;
+}
+
+static int is_whitelisted_clipboard(const char *cmd) {
+    if (!cmd) return 0;
+    for (int i = 0; i < whitelist_clipboard_count; i++)
+        if (whitelist_clipboard[i] && strcmp(whitelist_clipboard[i], cmd) == 0) return 1;
+    return 0;
+}
+
+/* Per-action is_blacklisted */
+static int is_blacklisted_screenshot(const char *cmd) {
+    if (!cmd) return 0;
+    for (int i = 0; i < blacklist_screenshot_count; i++)
+        if (blacklist_screenshot[i] && strcmp(blacklist_screenshot[i], cmd) == 0) return 1;
+    return 0;
+}
+
+static int is_blacklisted_screencast(const char *cmd) {
+    if (!cmd) return 0;
+    for (int i = 0; i < blacklist_screencast_count; i++)
+        if (blacklist_screencast[i] && strcmp(blacklist_screencast[i], cmd) == 0) return 1;
+    return 0;
+}
+
+static int is_blacklisted_xrecord(const char *cmd) {
+    if (!cmd) return 0;
+    for (int i = 0; i < blacklist_xrecord_count; i++)
+        if (blacklist_xrecord[i] && strcmp(blacklist_xrecord[i], cmd) == 0) return 1;
+    return 0;
+}
+
+static int is_blacklisted_clipboard(const char *cmd) {
+    if (!cmd) return 0;
+    for (int i = 0; i < blacklist_clipboard_count; i++)
+        if (blacklist_clipboard[i] && strcmp(blacklist_clipboard[i], cmd) == 0) return 1;
+    return 0;
+}
+
 
 static int policy_check(int idx)
 {
@@ -489,7 +549,15 @@ static void *inotify_policy_thread(void *param)
 					if(!strcmp(event->name, "user.rules") || !strcmp(event->name, "default.rules")||
 					!strcmp(event->name, "whitelist"))
 						read_policy();
-						read_whitelist();
+						read_list(WHITELIST_SCREENSHOT, whitelist_screenshot, &whitelist_screenshot_count);
+						read_list(WHITELIST_SCREENCAST, whitelist_screencast, &whitelist_screencast_count);
+						read_list(WHITELIST_XRECORD,    whitelist_xrecord,    &whitelist_xrecord_count);
+						read_list(WHITELIST_CLIPBOARD,  whitelist_clipboard,  &whitelist_clipboard_count);
+
+						read_list(BLACKLIST_SCREENSHOT, blacklist_screenshot, &blacklist_screenshot_count);
+						read_list(BLACKLIST_SCREENCAST, blacklist_screencast, &blacklist_screencast_count);
+						read_list(BLACKLIST_XRECORD,    blacklist_xrecord,    &blacklist_xrecord_count);
+						read_list(BLACKLIST_CLIPBOARD,  blacklist_clipboard,  &blacklist_clipboard_count);
 						//printf( "The file %s was Created with WD %d\n", event->name, event->wd );
 				}
 				 
@@ -564,7 +632,7 @@ static void make_log(int idx, pid_t cmdpid, const char *cmdname)
 		char message[256];
 		strcpy(message, cmdname);
 		strcat(message, NOTIFY_MSG_SCR);
-		dbus_notify_signal(cmdname, message);
+		dbus_notify_signal(idx, cmdname, message);
 		strcpy(message, LOG_SCREENSHOT_BODY);
 		strcat(message, cmdname);
 		strcat(message, "\n");
@@ -577,7 +645,7 @@ static void make_log(int idx, pid_t cmdpid, const char *cmdname)
 		char message[256];
 		strcpy(message, cmdname);
 		strcat(message, NOTIFY_MSG_SCR);
-		dbus_notify_signal(cmdname, message);
+		dbus_notify_signal(idx, cmdname, message);
 		strcpy(message, LOG_SCREENCAST_BODY);
 		strcat(message, cmdname);
 		strcat(message, "\n");
@@ -590,7 +658,7 @@ static void make_log(int idx, pid_t cmdpid, const char *cmdname)
 		char message[256];
 		strcpy(message, cmdname);
 		strcat(message, NOTIFY_MSG_SCR);
-		dbus_notify_signal(cmdname, message);
+		dbus_notify_signal(idx, cmdname, message);
 		strcpy(message, LOG_XRECORD_BODY);
 		strcat(message, cmdname);
 		strcat(message, "\n");
@@ -603,7 +671,7 @@ static void make_log(int idx, pid_t cmdpid, const char *cmdname)
 		char message[256];
 		strcpy(message, cmdname);
 		strcat(message, NOTIFY_MSG_CLP);
-		dbus_notify_signal(cmdname, message);;
+		dbus_notify_signal(idx, cmdname, message);;
 		strcpy(message, LOG_CLIPBOARD_BODY);
 		strcat(message, cmdname);
 		strcat(message, "\n");
@@ -648,34 +716,42 @@ XsmResource(CallbackListPtr *pcbl, void *unused, void *calldata){
 	cmdpid = GetClientPid(rec->client);
 
 	int request_client = rec->client->index;
-    Bool is_foreign_window = (rec->rtype == RT_WINDOW) && (cid != request_client);
+    Bool is_foreign_window = (cid != request_client);
 
 	if(requestName == NULL || cmdname == NULL)
 		return;
 
+
 	/* Check APIs of DixReadAccess */
 	if(requested & DixReadAccess)
 	{
-		/* Restrict Screencast e.g. recordmydesktop, kazam, scrot? */
-		if(rec->rtype == RT_WINDOW && !strcmp(requestName, "MIT-SHM:GetImage")){
+		/* Restrict Screenshot via XSHM */
+		if(is_foreign_window && !strcmp(requestName, "MIT-SHM:GetImage")){
 			XsmAudit("XsmResource: client(%d) access(%lx) to resource(0x%lx) "
 				"of client(%d) on request(%s) resource(%s) "
 				"cmdname: %s(%d) args: %s\n", 
 				rec->client->index,	(unsigned long)requested, 
 				(unsigned long)rec->id, cid, requestName, resourceName,
 				cmdname, cmdpid, cmdargs);
+
+			if (is_blacklisted_screenshot(cmdname)) {
+				rec->status = BadAccess;
+				return;
+			}
+			if (is_whitelisted_screenshot(cmdname)) {
+				return;
+			}
 			
-			if((!policy_check(XSM_SCREENSHOT) || !policy_check(XSM_SCREENCAST)) && !is_whitelist(cmdname) && is_foreign_window)
+			if((!policy_check(XSM_SCREENSHOT)))
 			{
 				if(!policy_check(XSM_SCREENSHOT)) make_log(LOG_SCREENSHOT, cmdpid, cmdname);
-				if(!policy_check(XSM_SCREENCAST)) make_log(LOG_SCREENCAST, cmdpid, cmdname);
 				rec->status = BadAccess;
 			}
 			return;
 		}
 
 		/* Restrict Screenshot via XGetImage (WINDOW) e.g. gtk2, gtk3, */
-		if(rec->rtype == RT_WINDOW && !strcmp(requestName, "X11:GetImage"))
+		if(is_foreign_window && !strcmp(requestName, "X11:GetImage"))
 		{
 			XsmAudit("XsmResource: client(%d) access(%lx) to resource(0x%lx) "
 				"of client(%d) on request(%s) resource(%s) "
@@ -683,8 +759,16 @@ XsmResource(CallbackListPtr *pcbl, void *unused, void *calldata){
 				rec->client->index,	(unsigned long)requested, 
 				(unsigned long)rec->id, cid, requestName, resourceName,
 				cmdname, cmdpid, cmdargs);
+
+			if (is_blacklisted_screenshot(cmdname)) {
+				rec->status = BadAccess;
+				return;
+			}
+			if (is_whitelisted_screenshot(cmdname)) {
+				return;
+			}
 			
-			if(!policy_check(XSM_SCREENSHOT) && !is_whitelist(cmdname) && is_foreign_window)
+			if(!policy_check(XSM_SCREENSHOT) && is_foreign_window)
 			{
 				make_log(LOG_SCREENSHOT, cmdpid, cmdname);
 				rec->status = BadAccess;
@@ -702,7 +786,15 @@ XsmResource(CallbackListPtr *pcbl, void *unused, void *calldata){
 				(unsigned long)rec->id, cid, requestName, resourceName, rec->rtype,
 				cmdname, cmdpid, cmdargs);
 
-			if(!policy_check(XSM_SCREENSHOT) && !is_whitelist(cmdname) && is_foreign_window)
+			if (is_blacklisted_screenshot(cmdname)) {
+				rec->status = BadAccess;
+				return;
+			}
+			if (is_whitelisted_screenshot(cmdname)) {
+				return;
+			}
+
+			if(!policy_check(XSM_SCREENSHOT) && is_foreign_window)
 			{
 				make_log(LOG_SCREENSHOT, cmdpid, cmdname);
 				rec->status = BadAccess;
@@ -712,7 +804,7 @@ XsmResource(CallbackListPtr *pcbl, void *unused, void *calldata){
 
 
 		/* Restrict Screenshot via gtk libraries and so on... */
-		if((rec->rtype == RT_WINDOW) && !strcmp(requestName, "X11:CopyArea"))
+		if((is_foreign_window) && !strcmp(requestName, "X11:CopyArea"))
 		{
 			XsmAudit("XsmResource: client(%d) access(%lx) to resource(0x%lx) "
 				"of client(%d) on request(%s) resource(%s,%u) "
@@ -720,8 +812,16 @@ XsmResource(CallbackListPtr *pcbl, void *unused, void *calldata){
 				rec->client->index,	(unsigned long)requested, 
 				(unsigned long)rec->id, cid, requestName, resourceName, rec->rtype,
 				cmdname, cmdpid, cmdargs);
+
+			if (is_blacklisted_screenshot(cmdname)) {
+				rec->status = BadAccess;
+				return;
+			}
+			if (is_whitelisted_screenshot(cmdname)) {
+				return;
+			}
 			
-			if(!policy_check(XSM_SCREENSHOT) && !is_whitelist(cmdname) && is_foreign_window)
+			if(!policy_check(XSM_SCREENSHOT) && is_foreign_window)
 			{
 				make_log(LOG_SCREENSHOT, cmdpid, cmdname);
 				rec->status = BadAccess;
@@ -772,8 +872,16 @@ XsmExtension(CallbackListPtr *pcbl, void *unused, void *calldata)
 				rec->client->index, rec->ext->name,
 				requestName,
 				cmdname, cmdpid, cmdargs);
+
+		if (is_blacklisted_xrecord(cmdname)) {
+            rec->status = BadAccess;
+            return;
+        }
+        if (is_whitelisted_xrecord(cmdname)) {
+            return;
+        }
 		
-		if(!policy_check(XSM_XRECORD) && !is_whitelist(cmdname))
+		if(!policy_check(XSM_XRECORD))
 		{
 			make_log(LOG_XRECORD, cmdpid, cmdname);
 			rec->status = BadAccess;
@@ -788,8 +896,16 @@ XsmExtension(CallbackListPtr *pcbl, void *unused, void *calldata)
 				rec->client->index, rec->ext->name,
 				requestName,
 				cmdname, cmdpid, cmdargs);
+
+		if (is_blacklisted_screencast(cmdname)) {
+            rec->status = BadAccess;
+            return;
+        }
+        if (is_whitelisted_screencast(cmdname)) {
+            return;
+        }
 		
-		if(!policy_check(XSM_SCREENCAST) && !is_whitelist(cmdname))
+		if(!policy_check(XSM_SCREENCAST))
 		{
 			make_log(LOG_SCREENCAST, cmdpid, cmdname);
 			rec->status = BadAccess;
@@ -874,6 +990,14 @@ XsmSelection(CallbackListPtr *pcbl, void *unused, void *calldata)
 				NameForAtom(name), name, pSel->window,
 				cmdname, cmdpid, cmdargs);
 
+		if (is_blacklisted_clipboard(cmdname)) {
+            rec->status = BadAccess;
+            return;
+        }
+        if (is_whitelisted_clipboard(cmdname)) {
+            return;
+        }
+
 		if(!policy_check(XSM_CLIPBOARD))
 		{
 			make_log(LOG_CLIPBOARD, cmdpid, cmdname);
@@ -936,7 +1060,15 @@ XsmExtensionInit(void)
 	/* Read Xsm policy file */
 	read_policy();
 
-	read_whitelist();
+	read_list(WHITELIST_SCREENSHOT, whitelist_screenshot, &whitelist_screenshot_count);
+    read_list(WHITELIST_SCREENCAST, whitelist_screencast, &whitelist_screencast_count);
+    read_list(WHITELIST_XRECORD,    whitelist_xrecord,    &whitelist_xrecord_count);
+    read_list(WHITELIST_CLIPBOARD,  whitelist_clipboard,  &whitelist_clipboard_count);
+
+    read_list(BLACKLIST_SCREENSHOT, blacklist_screenshot, &blacklist_screenshot_count);
+    read_list(BLACKLIST_SCREENCAST, blacklist_screencast, &blacklist_screencast_count);
+    read_list(BLACKLIST_XRECORD,    blacklist_xrecord,    &blacklist_xrecord_count);
+    read_list(BLACKLIST_CLIPBOARD,  blacklist_clipboard,  &blacklist_clipboard_count);
 
 	/* Run inotify policy loader */
 	inotify_policy();
