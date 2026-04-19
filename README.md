@@ -14,17 +14,12 @@ This project is a **enhanced version** of the original [X.org-Security-Module](h
 - D-Bus integration
 - Blocks spyware from capturing other processes' windows + RootWindow, but allows self-capture)
 
-## Files
-
-- **`xsm.c`** — The Xorg loadable extension module (compiled and loaded by the X server)
-- **`xsm-agent.c`** — User-space D-Bus agent that shows desktop notifications and handles whitelist additions
-
 ## Installation
 
 ### Prerequisites
 
 ``` bash
-sudo apt install build-essential pkg-config -y
+sudo apt install build-essential pkg-config pkexec -y
 sudo apt install xserver-xorg-dev libjson-c-dev libnotify-dev libdbus-1-dev -y
 sudo apt install libdbus-glib-1-dev -y
 sudo apt install libsystemd-dev -y
@@ -36,6 +31,7 @@ sudo apt install gtk+-3.0-dev -y
 ``` bash
 ./build.sh
 ./install.sh # then reboot :)
+./install_agent_daemon.sh
 ```
 
 ### Configuration Files
@@ -59,7 +55,7 @@ clipboard: allow
 
 ### Running
 
-- Run the agent at login (add to autostart):
+- Run the agent at login if `install_agent_daemon.sh` fails:
 
 ```bash
 xsm-agent &

@@ -1,0 +1,18 @@
+[Desktop Entry]
+Comment=Listens for XSM security violations and shows notifications
+Exec=/usr/local/bin/xsm-agent
+GenericName= XSM Agent
+Hidden=false
+Icon=xorg
+MimeType=
+Name=XSM Agent
+NoDisplay=false
+Path=
+StartupNotify=false
+Terminal=false
+TerminalOptions=
+Type=Application
+X-GNOME-Autostart-enabled=true
+X-KDE-RunOnDiscreteGpu=false
+X-KDE-SubstituteUID=false
+X-KDE-Username=
