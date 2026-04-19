@@ -4,6 +4,10 @@
 
 This project is a **enhanced version** of the original [X.org-Security-Module](https://github.com/ultract/X.org-Security-Module) by ultract.
 
+## Demo
+
+![](https://raw.githubusercontent.com/Marksonthegamer/X11WithPrivacy/refs/heads/master/test/Demo.mp4)
+
 ## Features
 
 - **Policy-based restrictions** (allow/disallow) for:
