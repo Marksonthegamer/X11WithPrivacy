@@ -5,8 +5,7 @@
 This project is a **enhanced version** of the original [X.org-Security-Module](https://github.com/ultract/X.org-Security-Module) by ultract.
 
 ## Demo
-
-![](https://raw.githubusercontent.com/Marksonthegamer/X11WithPrivacy/refs/heads/master/test/Demo.mp4)
+https://github.com/user-attachments/assets/7511789c-6d09-4305-ad39-937073e440b0
 
 ## Features
 
